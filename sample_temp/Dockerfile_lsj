@@ -1,0 +1,31 @@
+FROM ultralytics/ultralytics:8.4.23
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libgomp1 \
+    mosquitto \
+    mosquitto-clients \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    "PyYAML>=6.0" \
+    "paho-mqtt>=2.0.0" \
+    "aiohttp>=3.9.0" \
+    "aiortc>=1.6.0"
+
+RUN pip install --no-cache-dir \
+    git+https://github.com/ultralytics/CLIP.git \
+    ftfy \
+    regex \
+    tqdm
+
+RUN groupadd -g 1002 lsj && useradd -u 1002 -g 1002 -m lsj
+RUN chown -R lsj:lsj /app
+USER lsj
+
+COPY config.yml .
+COPY core ./core
+
+ENV PYTHONUNBUFFERED=1

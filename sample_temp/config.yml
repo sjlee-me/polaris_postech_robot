@@ -1,0 +1,18 @@
+robot_id: "2"
+
+# MQTT
+mqtt_host: "localhost"
+mqtt_port: 4729
+# 회피·명령 MQTT (필요 시 value 등으로 페이로드 확장)
+ai_avoidance_topic: "/robot/{robot_id}/ai-avoidance"
+motion_default: 1  # test.py에서 --motion 생략 시 (1=RUN)
+
+# 영상 채널
+num_video_channels: 2
+signaling_host: "localhost"
+signaling_port: 4732
+room_names: "room1,room2"
+
+# 로그 레벨
+log_level: "INFO"
+

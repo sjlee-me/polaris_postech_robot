@@ -1,0 +1,13 @@
+# MQTT·시그널링이 같은 호스트(또는 compose 네트워크)에서 떠 있어야 합니다.
+# localhost 브로커에 붙이려면 Linux에서 network_mode: host 를 사용하세요.
+services:
+  sample-test:
+    build: .
+    network_mode: host
+    tty: true
+    stdin_open: true
+    # 소스·설정은 호스트와 동기화 → 코드/config 수정 시 이미지 재빌드 없이 테스트 가능
+    # (requirements/Dockerfile 변경 시에만 build)
+    volumes:
+      - .:/app
+    working_dir: /app
