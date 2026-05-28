@@ -53,6 +53,7 @@ class VlaReferenceNode:
         self._last_graph_request_s = -1.0
         self._last_status_pub_s = -1.0
         self._last_vertex_pub_s = -1.0
+        self._last_detection_config_pub_s = -1.0
         self._last_detection_enable_pub_s = -1.0
         self._plot_ready = False
         self._plt = None
@@ -72,9 +73,9 @@ class VlaReferenceNode:
         bus.subscribe(robot_topic(robot_id, "detected_objects"), self.on_detected_objects)
 
     def start(self, sim_time_s: float) -> None:
-        self.state = "idle"
+        self.state = "initializing"
         self.request_graph(sim_time_s)
-        self.publish_detection_enable(sim_time_s, False)
+        self.publish_detection_config(sim_time_s)
 
     def tick(self, sim_time_s: float) -> None:
         if self.graph is None and (
@@ -83,17 +84,17 @@ class VlaReferenceNode:
         ):
             self.request_graph(sim_time_s)
 
+        self.update_state()
+
         if sim_time_s - self._last_status_pub_s >= 1.0:
             self.publish_status(sim_time_s)
             self._last_status_pub_s = sim_time_s
 
+        self.maybe_publish_detection_config(sim_time_s)
         self.maybe_publish_detection_enable(sim_time_s)
 
         if (
-            self.enabled
-            and self.graph is not None
-            and self.latest_pose is not None
-            and self.mission_id
+            self.state == "working"
             and sim_time_s - self._last_vertex_pub_s >= 1.0
         ):
             self.update_disabled_vertices()
@@ -120,35 +121,86 @@ class VlaReferenceNode:
         self.bus.publish(robot_topic(self.robot_id, "vla_status"), payload)
         self.logger.log(sim_time_s, f"publish vla_status enable={self.enabled} state={self.state}")
 
+    def publish_detection_config(self, sim_time_s: float) -> None:
+        payload = {
+            "robotId": self.robot_id,
+            "timestampMs": float(sim_time_s),
+            "classes": list(self.detection_classes),
+        }
+        self.bus.publish(robot_topic(self.robot_id, "detection_config"), payload)
+        self._last_detection_config_pub_s = sim_time_s
+        self.logger.log(sim_time_s, f"publish detection_config classes={self.detection_classes}")
+
     def publish_detection_enable(self, sim_time_s: float, enable: bool) -> None:
         payload = {
             "robotId": self.robot_id,
             "timestampMs": float(sim_time_s),
             "missionId": self.mission_id or "",
             "enable": bool(enable),
-            "classes": list(self.detection_classes),
         }
         self.bus.publish(robot_topic(self.robot_id, "detection_enable"), payload)
         self._last_detection_enable_pub_s = sim_time_s
-        self.logger.log(
-            sim_time_s,
-            f"publish detection_enable enable={enable} missionId={payload['missionId']} classes={self.detection_classes}",
-        )
+        self.logger.log(sim_time_s, f"publish detection_enable enable={enable} missionId={payload['missionId']}")
+
+    def maybe_publish_detection_config(self, sim_time_s: float) -> None:
+        if self.detection_config_ready():
+            return
+        if sim_time_s - self._last_detection_config_pub_s < 1.0:
+            return
+        self.publish_detection_config(sim_time_s)
 
     def maybe_publish_detection_enable(self, sim_time_s: float) -> None:
         if sim_time_s - self._last_detection_enable_pub_s < 1.0:
             return
 
         if self.enabled:
-            detection_ready = (
-                self.latest_detection_status is not None
-                and bool(self.latest_detection_status.get("enable", False))
-                and self.latest_detection_status.get("state") == "working"
-            )
-            if not detection_ready:
+            if not self.detection_working():
                 self.publish_detection_enable(sim_time_s, True)
         elif self.latest_detection_status and bool(self.latest_detection_status.get("enable", False)):
             self.publish_detection_enable(sim_time_s, False)
+
+    def detection_config_ready(self) -> bool:
+        if self.latest_detection_status is None:
+            return False
+        status_classes = self.latest_detection_status.get("classes", [])
+        return (
+            bool(self.latest_detection_status.get("classesSet", False))
+            and self.latest_detection_status.get("state") in {"idle", "working"}
+            and isinstance(status_classes, list)
+            and status_classes == self.detection_classes
+        )
+
+    def detection_idle(self) -> bool:
+        return (
+            self.detection_config_ready()
+            and self.latest_detection_status is not None
+            and self.latest_detection_status.get("state") == "idle"
+            and not bool(self.latest_detection_status.get("enable", False))
+        )
+
+    def detection_working(self) -> bool:
+        return (
+            self.detection_config_ready()
+            and self.latest_detection_status is not None
+            and bool(self.latest_detection_status.get("enable", False))
+            and self.latest_detection_status.get("state") == "working"
+        )
+
+    def update_state(self) -> None:
+        if self.enabled:
+            if (
+                self.graph is not None
+                and self.latest_pose is not None
+                and bool(self.mission_id)
+                and self.detection_working()
+            ):
+                self.state = "working"
+            else:
+                self.state = "initializing"
+        elif self.graph is not None and self.detection_idle():
+            self.state = "idle"
+        else:
+            self.state = "initializing"
 
     def publish_active_vertex_list(self, sim_time_s: float) -> None:
         active_vertices = self.current_active_vertices()
@@ -171,7 +223,7 @@ class VlaReferenceNode:
         self.latest_map_name = payload.get("mapName")
         self.latest_graph_name = payload.get("graphName")
         self.reset_active_vertices()
-        self.state = "idle"
+        self.update_state()
         self.setup_plot_if_needed()
         self.update_plot()
 
@@ -186,8 +238,7 @@ class VlaReferenceNode:
         self.mission_id = payload.get("missionId")
         self.latest_map_name = payload.get("mapName")
         self.latest_graph_name = payload.get("graphName")
-        if self.enabled and self.graph is not None:
-            self.state = "working"
+        self.update_state()
 
     def on_init_vertex(self, topic: str, payload: Dict[str, Any]) -> None:
         del topic
@@ -206,13 +257,14 @@ class VlaReferenceNode:
         self.mission_id = payload.get("missionId", self.mission_id)
         if self.enabled:
             self.list_detected_object.clear()
-        self.state = "working" if self.enabled and self.graph is not None else "idle"
+        self.update_state()
         self.publish_detection_enable(float(payload.get("timestampMs", 0.0)), self.enabled)
         self.update_plot()
 
     def on_detection_status(self, topic: str, payload: Dict[str, Any]) -> None:
         del topic
         self.latest_detection_status = payload
+        self.update_state()
         self.logger.log(
             float(payload.get("timestampMs", 0.0)),
             f"recv detection_status enable={payload.get('enable')} state={payload.get('state')}",

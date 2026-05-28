@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VLA Detection State Sequence</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --ink: #20242c;
+      --muted: #667085;
+      --line: #c9d2df;
+      --robot: #e9f7ef;
+      --robot-border: #40a66b;
+      --vla: #eef4ff;
+      --vla-border: #4f7dd9;
+      --det: #fff4e6;
+      --det-border: #e29335;
+      --arrow: #344054;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: Arial, Helvetica, sans-serif;
+    }
+
+    .page {
+      width: min(1260px, calc(100vw - 48px));
+      margin: 32px auto;
+    }
+
+    .diagram {
+      display: grid;
+      grid-template-columns: 260px 1fr;
+      background: white;
+      border: 1px solid #d8dee9;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(16, 24, 40, 0.08);
+    }
+
+    .time-panel {
+      position: relative;
+      padding: 0 28px;
+      border-right: 1px solid #d8dee9;
+      background: #fbfcff;
+    }
+
+    .time-axis {
+      position: absolute;
+      left: 36px;
+      top: 56px;
+      bottom: 56px;
+      width: 2px;
+      background: var(--line);
+    }
+
+    .time-event {
+      position: relative;
+      height: 250px;
+      padding-top: 58px;
+      padding-left: 36px;
+    }
+
+    .event-dot {
+      position: absolute;
+      left: 2px;
+      top: 62px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: var(--ink);
+      border: 3px solid white;
+      box-shadow: 0 0 0 1px var(--line);
+    }
+
+    .time {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .description {
+      font-size: 19px;
+      font-weight: 700;
+      line-height: 1.35;
+    }
+
+    .canvas {
+      min-width: 0;
+    }
+
+    .step {
+      position: relative;
+      min-height: 250px;
+      padding: 42px 56px 32px;
+      border-bottom: 1px solid #edf0f5;
+    }
+
+    .step:last-child { border-bottom: 0; }
+
+    .nodes {
+      position: relative;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 58px;
+      align-items: start;
+      z-index: 2;
+    }
+
+    .node-wrap {
+      min-width: 0;
+      text-align: center;
+    }
+
+    .node {
+      height: 104px;
+      border: 2px solid;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 23px;
+      font-weight: 800;
+      letter-spacing: 0;
+    }
+
+    .robot { background: var(--robot); border-color: var(--robot-border); }
+    .vla { background: var(--vla); border-color: var(--vla-border); }
+    .detection { background: var(--det); border-color: var(--det-border); }
+
+    .state {
+      margin-top: 14px;
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 12px;
+      border: 1px solid #d0d5dd;
+      border-radius: 6px;
+      background: white;
+      color: #344054;
+      font-family: Consolas, Monaco, monospace;
+      font-size: 15px;
+      white-space: nowrap;
+    }
+
+    .spacer-state { visibility: hidden; }
+
+    svg.arrows {
+      position: absolute;
+      left: 56px;
+      right: 56px;
+      top: 42px;
+      width: calc(100% - 112px);
+      height: 160px;
+      overflow: visible;
+      z-index: 3;
+      pointer-events: none;
+    }
+
+    .arrow-line {
+      stroke: var(--arrow);
+      stroke-width: 2.5;
+      fill: none;
+    }
+
+    .arrow-label {
+      fill: var(--arrow);
+      font-size: 15px;
+      font-weight: 700;
+      paint-order: stroke;
+      stroke: white;
+      stroke-width: 5px;
+      stroke-linejoin: round;
+    }
+
+    @media (max-width: 920px) {
+      .page { width: calc(100vw - 24px); margin: 16px auto; }
+      .diagram { grid-template-columns: 1fr; }
+      .time-panel { display: none; }
+      .canvas { overflow-x: auto; }
+      .step { min-width: 760px; padding: 34px 24px 28px; }
+      svg.arrows { left: 24px; right: 24px; width: calc(100% - 48px); }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="diagram" aria-label="VLA detection state sequence">
+      <aside class="time-panel">
+        <div class="time-axis"></div>
+        <div class="time-event">
+          <div class="event-dot"></div>
+          <div class="time">(0) t=0</div>
+          <div class="description">프로그램 시작</div>
+        </div>
+        <div class="time-event">
+          <div class="event-dot"></div>
+          <div class="time">(1) t=1</div>
+          <div class="description">detection node 준비 완료 (idle state 전환)</div>
+        </div>
+        <div class="time-event">
+          <div class="event-dot"></div>
+          <div class="time">(2) t=2</div>
+          <div class="description">VLA idle state 전환</div>
+        </div>
+      </aside>
+
+      <section class="canvas">
+        <section class="step" aria-label="t=0 startup">
+          <svg class="arrows" viewBox="0 0 840 160" preserveAspectRatio="none" aria-hidden="true">
+            <defs>
+              <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="strokeWidth">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#344054"></path>
+              </marker>
+            </defs>
+            <line class="arrow-line" x1="220" y1="42" x2="330" y2="42" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="275" y="26" text-anchor="middle">robot_infos</text>
+            <line class="arrow-line" x1="330" y1="78" x2="220" y2="78" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="275" y="62" text-anchor="middle">get_graph</text>
+            <line class="arrow-line" x1="510" y1="42" x2="620" y2="42" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="565" y="26" text-anchor="middle">detection_config</text>
+          </svg>
+          <div class="nodes">
+            <div class="node-wrap"><div class="node robot">Robot</div><div class="state spacer-state">state=""</div></div>
+            <div class="node-wrap"><div class="node vla">VLA</div><div class="state">state="initializing"</div></div>
+            <div class="node-wrap"><div class="node detection">Detection</div><div class="state">state="initializing"</div></div>
+          </div>
+        </section>
+
+        <section class="step" aria-label="t=1 detection ready">
+          <svg class="arrows" viewBox="0 0 840 160" preserveAspectRatio="none" aria-hidden="true">
+            <line class="arrow-line" x1="330" y1="55" x2="220" y2="55" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="275" y="38" text-anchor="middle">vla_status</text>
+            <line class="arrow-line" x1="620" y1="55" x2="510" y2="55" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="565" y="38" text-anchor="middle">detection_status</text>
+          </svg>
+          <div class="nodes">
+            <div class="node-wrap"><div class="node robot">Robot</div><div class="state spacer-state">state=""</div></div>
+            <div class="node-wrap"><div class="node vla">VLA</div><div class="state">state="initializing"</div></div>
+            <div class="node-wrap"><div class="node detection">Detection</div><div class="state">state="idle"</div></div>
+          </div>
+        </section>
+
+        <section class="step" aria-label="t=2 vla idle">
+          <svg class="arrows" viewBox="0 0 840 160" preserveAspectRatio="none" aria-hidden="true">
+            <line class="arrow-line" x1="330" y1="55" x2="220" y2="55" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="275" y="38" text-anchor="middle">vla_status</text>
+            <line class="arrow-line" x1="620" y1="55" x2="510" y2="55" marker-end="url(#arrowhead)"></line>
+            <text class="arrow-label" x="565" y="38" text-anchor="middle">detection_status</text>
+          </svg>
+          <div class="nodes">
+            <div class="node-wrap"><div class="node robot">Robot</div><div class="state spacer-state">state=""</div></div>
+            <div class="node-wrap"><div class="node vla">VLA</div><div class="state">state="idle"</div></div>
+            <div class="node-wrap"><div class="node detection">Detection</div><div class="state">state="idle"</div></div>
+          </div>
+        </section>
+      </section>
+    </section>
+  </main>
+</body>
+</html>

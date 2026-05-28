@@ -197,16 +197,18 @@ class DetectionNode:
         self.conf = conf
         self.status_interval_s = status_interval_s
         self.enabled = False
-        self.state = "idle"
+        self.state = "initializing"
         self.mission_id: Optional[str] = None
         self.model_loaded = False
         self.target_classes: List[str] = []
+        self.classes_set = False
         self.latest_robot_infos: Optional[Dict[str, Any]] = None
         self.latest_image_path: Optional[str] = None
         self._model: Any = None
         self._last_status_pub_s = -1.0
         self._last_image_key: Optional[Tuple[str, int]] = None
 
+        bus.subscribe(robot_topic(robot_id, "detection_config"), self.on_detection_config)
         bus.subscribe(robot_topic(robot_id, "detection_enable"), self.on_detection_enable)
         bus.subscribe(robot_topic(robot_id, "robot_infos"), self.on_robot_infos)
 
@@ -225,8 +227,8 @@ class DetectionNode:
         self.logger.log(sim_time_s, f"load YOLOWorld weights={self.weights}")
         self._model = YOLOWorld(self.weights)
         self.model_loaded = True
-        if self.enabled and self.target_classes:
-            self._model.set_classes(self.target_classes)
+        if self.target_classes:
+            self.set_model_classes(sim_time_s)
         self.logger.log(sim_time_s, "YOLOWorld model ready")
 
     def tick(self, sim_time_s: float) -> None:
@@ -240,12 +242,12 @@ class DetectionNode:
             self.process_latest_image(sim_time_s)
 
     def update_state(self) -> None:
-        if not self.enabled:
-            self.state = "idle"
-        elif self.model_loaded and self.target_classes and self.latest_robot_infos is not None:
-            self.state = "working"
-        else:
+        if not self.model_loaded or not self.target_classes or not self.classes_set:
             self.state = "initializing"
+        elif self.enabled:
+            self.state = "working" if self.latest_robot_infos is not None else "initializing"
+        else:
+            self.state = "idle"
 
     def publish_status(self, sim_time_s: float) -> None:
         payload = {
@@ -255,45 +257,74 @@ class DetectionNode:
             "enable": self.enabled,
             "state": self.state,
             "classes": list(self.target_classes),
+            "classesSet": self.classes_set,
         }
         self.bus.publish(robot_topic(self.robot_id, "detection_status"), payload)
-        self.logger.log(sim_time_s, f"publish detection_status state={self.state}")
+        self.logger.log(sim_time_s, f"publish detection_status enable={self.enabled} state={self.state}")
+
+    def on_detection_config(self, topic: str, payload: Dict[str, Any]) -> None:
+        del topic
+        sim_time_s = float(payload.get("timestampMs", 0.0))
+        classes = payload.get("classes", [])
+        if not isinstance(classes, list):
+            self.target_classes = []
+            self.classes_set = False
+            self.update_state()
+            self.logger.log(sim_time_s, "ignore detection_config: classes is not a list")
+            return
+
+        target_classes = [str(item).strip() for item in classes if str(item).strip()]
+        if not target_classes:
+            self.target_classes = []
+            self.classes_set = False
+            self.update_state()
+            self.logger.log(sim_time_s, "ignore detection_config: empty classes")
+            return
+
+        if target_classes != self.target_classes:
+            self.target_classes = target_classes
+            self.classes_set = False
+            self._last_image_key = None
+
+        if self.model_loaded:
+            self.set_model_classes(sim_time_s)
+
+        self.update_state()
+        self.logger.log(sim_time_s, f"update detection_config classes={self.target_classes} classesSet={self.classes_set}")
+
+    def set_model_classes(self, sim_time_s: float) -> None:
+        if self._model is None or not self.target_classes:
+            self.classes_set = False
+            return
+
+        self._model.set_classes(self.target_classes)
+        self.classes_set = self.model_classes_match()
+        self.logger.log(
+            sim_time_s,
+            f"set detection classes requested={self.target_classes} modelNames={self.model_class_names()} classesSet={self.classes_set}",
+        )
+
+    def model_class_names(self) -> List[str]:
+        if self._model is None:
+            return []
+        names = getattr(self._model, "names", None) # _model.names = {0: 'fire extinguisher'}
+        if isinstance(names, dict):
+            return [str(names[key]) for key in sorted(names)]
+        if isinstance(names, list):
+            return [str(item) for item in names]
+        return []
+
+    def model_classes_match(self) -> bool:
+        return self.model_class_names() == self.target_classes
 
     def on_detection_enable(self, topic: str, payload: Dict[str, Any]) -> None:
         del topic
         sim_time_s = float(payload.get("timestampMs", 0.0))
         self.enabled = bool(payload.get("enable", False))
         self.mission_id = payload.get("missionId", self.mission_id)
-
-        if not self.enabled:
-            self._last_image_key = None
-            self.update_state()
-            self.logger.log(sim_time_s, "update detection_enable enable=False")
-            return
-
-        classes = payload.get("classes", [])
-        if not isinstance(classes, list):
-            self.target_classes = []
-            self.update_state()
-            self.logger.log(sim_time_s, "ignore detection_enable: classes is not a list")
-            return
-
-        target_classes = [str(item).strip() for item in classes if str(item).strip()]
-        if not target_classes:
-            self.target_classes = []
-            self.update_state()
-            self.logger.log(sim_time_s, "ignore detection_enable: empty classes")
-            return
-
-        self.target_classes = target_classes
         self._last_image_key = None
-        if self.model_loaded and self._model is not None:
-            self._model.set_classes(self.target_classes)
         self.update_state()
-        self.logger.log(
-            sim_time_s,
-            f"update detection_enable enable=True missionId={self.mission_id} classes={self.target_classes}",
-        )
+        self.logger.log(sim_time_s, f"update detection_enable enable={self.enabled} missionId={self.mission_id}")
 
     def on_robot_infos(self, topic: str, payload: Dict[str, Any]) -> None:
         del topic
@@ -319,7 +350,6 @@ class DetectionNode:
         }
     
     # TODO: 정확히 어떤 이미지를 읽어서 detection 모델 돌릴지 협의 필요
-    # 현재는 image_dir에서 가장 최근에 수정된 이미지를 찾아서 처리하도록 구현되어 있음
     def process_latest_image(self, sim_time_s: float) -> None:
         latest = self.find_latest_image()
         if latest is None:
