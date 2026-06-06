@@ -2,3 +2,6 @@ __pycache__
 
 .vscode
 *.pt
+*.ts
+
+*.jpg

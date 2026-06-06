@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from mqtt_protocol_sim import Logger, PahoMqttTransport, TopicTransport, robot_topic
 
 
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("calibration.json")
 DEFAULT_GROUND_PATH = Path(__file__).resolve().with_name("ground.json")
 LOCAL_COORD_PROJECTOR: Optional["GroundPlaneProjector"] = None
@@ -178,13 +179,102 @@ def translate_bbox_to_local_coord(
     return LOCAL_COORD_PROJECTOR.project_pixel_to_local(pixel_x, pixel_y)
 
 
+class WebRTCFrameSource:
+    """로봇 카메라에서 WebRTC로 들어오는 실시간 프레임 중 '최신 한 장'만 들고 있는다.
+
+    WebRTC 콜백은 단일 슬롯에 프레임을 '덮어쓰기'만 한다
+    (추론이 스트림 속도를 못 따라가도 항상 최신 프레임을 처리, 큐 적체/stale 결과 방지).
+    WebRTCVideoReceiver.run() 은 코루틴이므로 자체 asyncio 이벤트 루프를 백그라운드 스레드에서 돌려
+    DetectionNode 의 동기 tick 루프와 분리한다.
+    """
+
+    def __init__(
+        self,
+        signaling_host: str,
+        signaling_port: int,
+        room: str,
+        detect_channel: int,
+        logger: Logger,
+    ) -> None:
+        self.signaling_host = signaling_host
+        self.signaling_port = signaling_port
+        self.room = room
+        self.detect_channel = detect_channel
+        self.logger = logger
+        self._lock = threading.Lock()
+        self._latest: Optional[Tuple[int, Any, float]] = None  # (seq, img_bgr, stream_ts)
+        self._seq = 0
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._run_task: Optional["asyncio.Task[Any]"] = None
+        self._receiver: Any = None
+        self._receiver_cls: Any = None
+
+    def _on_frame(self, channel: int, img: Any, stream_ts: float) -> None:
+        # WebRTC 수신 스레드에서 호출됨. detect 채널만 슬롯에 덮어쓴다.
+        if channel != self.detect_channel:
+            return
+        with self._lock:
+            self._seq += 1
+            # img 버퍼가 재사용될 수 있으니 반드시 copy (sample DetectionWorker.submit 과 동일).
+            self._latest = (self._seq, img.copy(), float(stream_ts))
+
+    def get_latest(self) -> Optional[Tuple[int, Any, float]]:
+        with self._lock:
+            return self._latest
+
+    def start(self) -> None:
+        try:
+            from core.webrtc_video import WebRTCVideoReceiver  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "WebRTC source requires aiohttp/aiortc and the sample_temp/core package. "
+                "Install with: pip install aiohttp aiortc"
+            ) from exc
+
+        self._receiver_cls = WebRTCVideoReceiver
+        self._thread = threading.Thread(target=self._run, name="webrtc-recv", daemon=True)
+        self._thread.start()
+        self.logger.log(
+            0.0,
+            f"webrtc source start room={self.room} channel={self.detect_channel} "
+            f"signaling={self.signaling_host}:{self.signaling_port}",
+        )
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._receiver = self._receiver_cls(
+            signaling_host=self.signaling_host,
+            signaling_port=self.signaling_port,
+            room_names=[self.room],
+            on_frame_callback=self._on_frame,
+        )
+        self._run_task = self._loop.create_task(self._receiver.run())
+        try:
+            self._loop.run_until_complete(self._run_task)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._loop.close()
+
+    def stop(self) -> None:
+        if self._receiver is not None:
+            self._receiver.shutdown()
+        if self._loop is not None and self._run_task is not None:
+            self._loop.call_soon_threadsafe(self._run_task.cancel)
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+
 class DetectionNode:
     def __init__(
         self,
         bus: TopicTransport,
         robot_id: int,
         logger: Logger,
-        image_dir: Path,
+        frame_source: "WebRTCFrameSource",
+        det_output_dir: Path,
         weights: str,
         conf: float,
         status_interval_s: float,
@@ -192,7 +282,8 @@ class DetectionNode:
         self.bus = bus
         self.robot_id = robot_id
         self.logger = logger
-        self.image_dir = image_dir
+        self.frame_source = frame_source
+        self.det_output_dir = det_output_dir
         self.weights = weights
         self.conf = conf
         self.status_interval_s = status_interval_s
@@ -206,7 +297,7 @@ class DetectionNode:
         self.latest_image_path: Optional[str] = None
         self._model: Any = None
         self._last_status_pub_s = -1.0
-        self._last_image_key: Optional[Tuple[str, int]] = None
+        self._last_frame_seq: int = 0
 
         bus.subscribe(robot_topic(robot_id, "detection_config"), self.on_detection_config)
         bus.subscribe(robot_topic(robot_id, "detection_enable"), self.on_detection_enable)
@@ -218,18 +309,18 @@ class DetectionNode:
 
     def load_model(self, sim_time_s: float) -> None:
         try:
-            from ultralytics import YOLOWorld  # type: ignore
+            from ultralytics import YOLOWorld, YOLOE  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
                 "ultralytics is required for detection mode. Install with: pip install ultralytics"
             ) from exc
 
-        self.logger.log(sim_time_s, f"load YOLOWorld weights={self.weights}")
-        self._model = YOLOWorld(self.weights)
+        self.logger.log(sim_time_s, f"load YOLOE weights={self.weights}")
+        self._model = YOLOE(self.weights)
         self.model_loaded = True
         if self.target_classes:
             self.set_model_classes(sim_time_s)
-        self.logger.log(sim_time_s, "YOLOWorld model ready")
+        self.logger.log(sim_time_s, "YOLOE model ready")
 
     def tick(self, sim_time_s: float) -> None:
         self.update_state()
@@ -284,7 +375,7 @@ class DetectionNode:
         if target_classes != self.target_classes:
             self.target_classes = target_classes
             self.classes_set = False
-            self._last_image_key = None
+            self._last_frame_seq = 0
 
         if self.model_loaded:
             self.set_model_classes(sim_time_s)
@@ -322,7 +413,7 @@ class DetectionNode:
         sim_time_s = float(payload.get("timestampMs", 0.0))
         self.enabled = bool(payload.get("enable", False))
         self.mission_id = payload.get("missionId", self.mission_id)
-        self._last_image_key = None
+        self._last_frame_seq = 0
         self.update_state()
         self.logger.log(sim_time_s, f"update detection_enable enable={self.enabled} missionId={self.mission_id}")
 
@@ -349,70 +440,58 @@ class DetectionNode:
             "graphName": payload.get("graphName"),
         }
     
-    # TODO: 정확히 어떤 이미지를 읽어서 detection 모델 돌릴지 협의 필요
     def process_latest_image(self, sim_time_s: float) -> None:
-        latest = self.find_latest_image()
+        latest = self.frame_source.get_latest()
         if latest is None:
             return
 
-        image_path, mtime_ns = latest
-        image_key = (str(image_path), mtime_ns)
-        if image_key == self._last_image_key:
+        seq, img, _stream_ts = latest
+        if seq == self._last_frame_seq:
             return
 
         robot_infos = self.latest_robot_infos
         if robot_infos is None:
             return
 
-        image_size = self.read_image_size(image_path)
-        self.logger.log(sim_time_s, f"predict image={image_path}")
-        results = self._model.predict(str(image_path), verbose=False, conf=self.conf)
+        height, width = img.shape[:2]
+        image_size = {"width": int(width), "height": int(height)}
+        results = self._model.predict(img, verbose=False, conf=self.conf)
         objects = self.build_info_detected_objects(results, image_size, robot_infos)
+        image_path = self.save_annotated_frame(results, sim_time_s, seq)
 
         payload = {
             "robotId": self.robot_id,
             "timestampMs": float(sim_time_s),
-            "imagePath": str(image_path.resolve()),
+            "imagePath": image_path,
             "imageSize": image_size,
             "robotInfos": robot_infos,
             "classes": list(self.target_classes),
             "objects": objects,
         }
         self.bus.publish(robot_topic(self.robot_id, "detected_objects"), payload)
-        self.latest_image_path = str(image_path.resolve())
-        self._last_image_key = image_key
-        self.logger.log(sim_time_s, f"publish detected_objects count={len(objects)} image={image_path.name}")
+        self.latest_image_path = image_path
+        self._last_frame_seq = seq
+        self.logger.log(sim_time_s, f"publish detected_objects count={len(objects)} seq={seq}")
 
-    def find_latest_image(self) -> Optional[Tuple[Path, int]]:
-        if not self.image_dir.exists():
-            return None
-
-        latest_path: Optional[Path] = None
-        latest_mtime_ns = -1
-        for path in self.image_dir.iterdir():
-            if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
-                continue
-            try:
-                mtime_ns = path.stat().st_mtime_ns
-            except OSError:
-                continue
-            if mtime_ns > latest_mtime_ns:
-                latest_path = path
-                latest_mtime_ns = mtime_ns
-
-        if latest_path is None:
-            return None
-        return latest_path, latest_mtime_ns
-
-    def read_image_size(self, image_path: Path) -> Dict[str, int]:
+    def save_annotated_frame(self, results: Any, sim_time_s: float, seq: int) -> Optional[str]:
+        """추론 결과(bbox)가 그려진 프레임을 디스크에 저장하고 경로를 반환한다."""
         try:
-            from PIL import Image  # type: ignore
+            import cv2  # type: ignore
         except ImportError as exc:
-            raise RuntimeError("Pillow is required to read image sizes. Install with: pip install pillow") from exc
+            raise RuntimeError(
+                "opencv-python is required to save annotated frames. Install with: pip install opencv-python"
+            ) from exc
 
-        with Image.open(image_path) as image:
-            width, height = image.size
-        return {"width": int(width), "height": int(height)}
+        if not results:
+            return None
+
+        annotated = results[0].plot()  # bbox 그려진 BGR ndarray (sample 의 r.plot() 과 동일)
+        self.det_output_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.det_output_dir / f"{sim_time_s:.3f}_{seq:06d}.jpg"
+        if not cv2.imwrite(str(out_path), annotated):
+            self.logger.log(sim_time_s, f"failed to save annotated frame {out_path}")
+            return None
+        return str(out_path.resolve())
 
     def build_info_detected_objects(
         self,
@@ -474,8 +553,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1883)
     parser.add_argument("--robot-id", type=int, default=1)
-    parser.add_argument("--image-dir", default="./camera_images")
-    parser.add_argument("--weights", default="yolov8x-worldv2.pt")
+    parser.add_argument("--signaling-host", default="localhost")
+    parser.add_argument("--signaling-port", type=int, default=4732)
+    parser.add_argument("--room", default="room1", help="detection 에 사용할 카메라 room 이름")
+    parser.add_argument("--detect-channel", type=int, default=0, help="room_names 내 detect 채널 인덱스")
+    parser.add_argument("--det-output-dir", default="./detections", help="bbox 그린 결과 프레임 저장 경로")
+    parser.add_argument("--weights", default="yoloe-26x-seg.pt")
     parser.add_argument("--poll-interval", type=float, default=0.2)
     parser.add_argument("--status-interval", type=float, default=1.0)
     parser.add_argument("--conf", type=float, default=0.5)
@@ -489,8 +572,6 @@ def main() -> None:
 
     args = parse_args()
     logger = Logger("detection-node")
-    image_dir = Path(args.image_dir)
-    image_dir.mkdir(parents=True, exist_ok=True)
     LOCAL_COORD_PROJECTOR = GroundPlaneProjector.from_paths(
         calibration_path=Path(args.calibration),
         ground_path=Path(args.ground),
@@ -503,17 +584,26 @@ def main() -> None:
         client_id=f"detection-node-robotid{args.robot_id}",
         logger=logger,
     )
+    frame_source = WebRTCFrameSource(
+        signaling_host=args.signaling_host,
+        signaling_port=args.signaling_port,
+        room=args.room,
+        detect_channel=args.detect_channel,
+        logger=logger,
+    )
     node = DetectionNode(
         transport,
         args.robot_id,
         logger,
-        image_dir=image_dir,
+        frame_source=frame_source,
+        det_output_dir=Path(args.det_output_dir),
         weights=args.weights,
         conf=args.conf,
         status_interval_s=args.status_interval,
     )
 
     transport.start()
+    frame_source.start()
     start_wall = time.monotonic()
     try:
         node.start(0.0)
@@ -524,6 +614,7 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.log(time.monotonic() - start_wall, "shutdown requested")
     finally:
+        frame_source.stop()
         transport.stop()
 
 
