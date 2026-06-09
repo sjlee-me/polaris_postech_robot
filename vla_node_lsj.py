@@ -13,7 +13,7 @@ from mqtt_protocol_sim import Logger, PahoMqttTransport, TopicTransport, robot_t
 
 
 DEFAULT_DETECTION_CLASSES = ["fire extinguisher"]
-DEFAULT_DETECTION_DISABLE_RADIUS_M = 1.5
+DEFAULT_DETECTION_DISABLE_RADIUS_M = 1
 MAX_DETECTED_OBJECT_DISTANCE_M = 5.0
 DETECTED_OBJECT_MERGE_RADIUS_M = 0.1
 
@@ -142,6 +142,29 @@ class VlaReferenceNode:
         self._last_detection_enable_pub_s = sim_time_s
         self.logger.log(sim_time_s, f"publish detection_enable enable={enable} missionId={payload['missionId']}")
 
+    def publish_detected_object_debug(
+        self,
+        timestamp_ms: float,
+        class_name: str,
+        local_x: float,
+        local_y: float,
+        global_x: float,
+        global_y: float,
+        robot_x: float,
+        robot_y: float,
+        robot_theta: float,
+    ) -> None:
+        payload = {
+            "robotId": self.robot_id,
+            "timestampMs": float(timestamp_ms),
+            "missionId": self.mission_id or "",
+            "className": class_name,
+            "local": {"x": local_x, "y": local_y},
+            "global": {"x": global_x, "y": global_y},
+            "robot": {"x": robot_x, "y": robot_y, "theta": robot_theta},
+        }
+        self.bus.publish(robot_topic(self.robot_id, "detected_object_debug"), payload)
+
     def maybe_publish_detection_config(self, sim_time_s: float) -> None:
         if self.detection_config_ready():
             return
@@ -222,6 +245,14 @@ class VlaReferenceNode:
         self.graph = payload["graph"]
         self.latest_map_name = payload.get("mapName")
         self.latest_graph_name = payload.get("graphName")
+        vertices = self.graph.get("vertices", []) if isinstance(self.graph, dict) else []
+        edges = self.graph.get("edges", []) if isinstance(self.graph, dict) else []
+        self.logger.log(
+            float(payload.get("timestampMs", 0.0)),
+            f"recv graph requestId={payload.get('requestId')} "
+            f"mapName={self.latest_map_name} graphName={self.latest_graph_name} "
+            f"vertices={len(vertices)} edges={len(edges)}",
+        )
         self.reset_active_vertices()
         self.update_state()
         self.setup_plot_if_needed()
@@ -255,6 +286,10 @@ class VlaReferenceNode:
         del topic
         self.enabled = bool(payload.get("enable", False))
         self.mission_id = payload.get("missionId", self.mission_id)
+        self.logger.log(
+            float(payload.get("timestampMs", 0.0)),
+            f"recv vla_enable enable={self.enabled} missionId={self.mission_id}",
+        )
         if self.enabled:
             self.list_detected_object.clear()
         self.update_state()
@@ -303,9 +338,9 @@ class VlaReferenceNode:
                     except (KeyError, TypeError, ValueError):
                         continue
 
-                    # Filter out detections that are too far away in local coordinates to be robust against noisy detections
-                    if math.hypot(local_x, local_y) > MAX_DETECTED_OBJECT_DISTANCE_M:
-                        continue
+                    # # Filter out detections that are too far away in local coordinates to be robust against noisy detections
+                    # if math.hypot(local_x, local_y) > MAX_DETECTED_OBJECT_DISTANCE_M:
+                    #     continue
 
                     try:
                         pose = robot_infos.get("pose", {})
@@ -318,6 +353,25 @@ class VlaReferenceNode:
                         global_y = robot_y + local_x * math.sin(robot_theta) + local_y * math.cos(robot_theta)
                     except (KeyError, TypeError, ValueError):
                         continue
+
+                    self.logger.log(
+                        float(timestamp_ms or 0.0),
+                        f"detected_object class={class_name} "
+                        f"local=({local_x:.3f}, {local_y:.3f}) "
+                        f"global=({global_x:.3f}, {global_y:.3f}) "
+                        f"robot=({robot_x:.3f}, {robot_y:.3f}, theta={robot_theta:.3f})",
+                    )
+                    self.publish_detected_object_debug(
+                        float(timestamp_ms or 0.0),
+                        class_name,
+                        local_x,
+                        local_y,
+                        global_x,
+                        global_y,
+                        robot_x,
+                        robot_y,
+                        robot_theta,
+                    )
 
                     if self.is_same_detected_object(class_name, global_x, global_y):
                         continue

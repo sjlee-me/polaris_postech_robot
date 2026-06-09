@@ -9,14 +9,15 @@ import json
 import math
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from mqtt_protocol_sim import Logger, PahoMqttTransport, TopicTransport, robot_topic
 
 
-DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("calibration.json")
-DEFAULT_GROUND_PATH = Path(__file__).resolve().with_name("ground.json")
+DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("current_camera.json")
+DEFAULT_GROUND_PATH = Path(__file__).resolve().with_name("current_ground.json")
 LOCAL_COORD_PROJECTOR: Optional["GroundPlaneProjector"] = None
 
 
@@ -139,9 +140,10 @@ class GroundPlaneProjector:
         ground_y = dot(rel, self.y_axis_w) * self.world_to_meter_scale
 
         # Protocol convention: local x is robot-forward and local y is robot-left.
-        # In the current ground calibration, +ground_x points robot-right and
-        # +ground_y points robot-backward, so flip and swap into robot local axes.
-        local_x = -ground_y
+        # current_ground.json calibration: +ground_y points robot-forward and
+        # +ground_x points robot-right, so map +ground_y -> +x and -ground_x -> +y.
+        # (keeps a right-handed robot frame: x forward, y left, z up)
+        local_x = ground_y
         local_y = -ground_x
         return {"x": float(local_x), "y": float(local_y)}
 
@@ -283,7 +285,8 @@ class DetectionNode:
         self.robot_id = robot_id
         self.logger = logger
         self.frame_source = frame_source
-        self.det_output_dir = det_output_dir
+        # run 마다 구분되는 subfolder 생성 (det_output_dir/run_YYYYmmdd_HHMMSS)
+        self.det_output_dir = det_output_dir / f"run_{datetime.now():%Y%m%d_%H%M%S}"
         self.weights = weights
         self.conf = conf
         self.status_interval_s = status_interval_s

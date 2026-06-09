@@ -1,4 +1,4 @@
-FROM ultralytics/ultralytics:8.4.23
+FROM ultralytics/ultralytics:8.4.23-nvidia-arm64
 
 WORKDIR /app
 
@@ -21,11 +21,9 @@ RUN pip install --no-cache-dir \
     regex \
     tqdm
 
-RUN groupadd -g 1002 lsj && useradd -u 1002 -g 1002 -m lsj
-RUN chown -R lsj:lsj /app
-USER lsj
+RUN groupadd -g 1004 scaleup && useradd -u 1004 -g 1004 -m scaleup
+RUN chown -R scaleup:scaleup /app
+USER scaleup
 
-COPY config.yml .
-COPY core ./core
 
 ENV PYTHONUNBUFFERED=1
