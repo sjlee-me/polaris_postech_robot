@@ -1,4 +1,4 @@
-FROM ultralytics/ultralytics:8.4.23-nvidia-arm64
+FROM ultralytics/ultralytics:8.4.56-nvidia-arm64
 
 WORKDIR /app
 

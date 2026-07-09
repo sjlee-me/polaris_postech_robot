@@ -20,6 +20,32 @@ DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().with_name("current_camera.js
 DEFAULT_GROUND_PATH = Path(__file__).resolve().with_name("current_ground.json")
 LOCAL_COORD_PROJECTOR: Optional["GroundPlaneProjector"] = None
 
+# 카메라 양 옆(좌/우)과 아래쪽 외곽은 렌즈 왜곡이 커서 ground projection 신뢰도가 떨어진다.
+# 소화기 bbox 하단 변의 중점(=(cx, y2)) 이 이미지의 '가운데 영역' 안에 있을 때만 좌표를 신뢰한다.
+DETECTION_VALID_X_MARGIN_RATIO = 0.15  # 좌/우 각각 가장자리에서 제외할 폭 비율
+DETECTION_VALID_BOTTOM_MARGIN_RATIO = 0.0  # 아래쪽 가장자리에서 제외할 높이 비율
+
+
+def is_pixel_in_valid_region(
+    pixel_x: float,
+    pixel_y: float,
+    image_size: Dict[str, int],
+) -> bool:
+    """bbox 하단 중점이 이미지 가운데 영역(왜곡이 적은 영역) 안에 있는지 확인한다.
+
+    좌/우 가장자리(DETECTION_VALID_X_MARGIN_RATIO)와 아래쪽 가장자리
+    (DETECTION_VALID_BOTTOM_MARGIN_RATIO)는 신뢰하지 않는다.
+    이미지 크기를 알 수 없으면 거르지 않는다.
+    """
+    width = float(image_size.get("width", 0))
+    height = float(image_size.get("height", 0))
+    if width <= 0 or height <= 0:
+        return True
+    min_x = width * DETECTION_VALID_X_MARGIN_RATIO
+    max_x = width * (1.0 - DETECTION_VALID_X_MARGIN_RATIO)
+    max_y = height * (1.0 - DETECTION_VALID_BOTTOM_MARGIN_RATIO)
+    return min_x <= pixel_x <= max_x and pixel_y <= max_y
+
 
 def dot(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
@@ -172,12 +198,15 @@ def translate_bbox_to_local_coord(
 ) -> Optional[Dict[str, float]]:
     """Convert a detected bbox into a robot-local coordinate."""
 
-    del image_size, class_name, confidence, robot_infos
+    del class_name, confidence, robot_infos
     if LOCAL_COORD_PROJECTOR is None:
         return None
 
     pixel_x = float(bbox["cx"])
     pixel_y = float(bbox["y2"])
+    # 좌/우 가장자리나 너무 아래쪽에 잡힌 detection 은 왜곡 때문에 좌표를 믿지 않는다.
+    if not is_pixel_in_valid_region(pixel_x, pixel_y, image_size):
+        return None
     return LOCAL_COORD_PROJECTOR.project_pixel_to_local(pixel_x, pixel_y)
 
 
@@ -211,15 +240,27 @@ class WebRTCFrameSource:
         self._run_task: Optional["asyncio.Task[Any]"] = None
         self._receiver: Any = None
         self._receiver_cls: Any = None
+        self._last_frame_arrival_s: Optional[float] = None
 
     def _on_frame(self, channel: int, img: Any, stream_ts: float) -> None:
         # WebRTC 수신 스레드에서 호출됨. detect 채널만 슬롯에 덮어쓴다.
         if channel != self.detect_channel:
             return
+        now = time.monotonic()
         with self._lock:
             self._seq += 1
+            seq = self._seq
             # img 버퍼가 재사용될 수 있으니 반드시 copy (sample DetectionWorker.submit 과 동일).
-            self._latest = (self._seq, img.copy(), float(stream_ts))
+            self._latest = (seq, img.copy(), float(stream_ts))
+            prev_arrival = self._last_frame_arrival_s
+            self._last_frame_arrival_s = now
+        # 프레임이 카메라/스트림에서 실제로 몇 초마다 들어오는지 로깅.
+        if prev_arrival is None:
+            self.logger.log(0.0, f"frame arrival seq={seq} (first frame)")
+        else:
+            interval = now - prev_arrival
+            fps = (1.0 / interval) if interval > 0 else float("inf")
+            # self.logger.log(0.0, f"frame arrival seq={seq} interval={interval:.3f}s (~{fps:.2f} fps)")
 
     def get_latest(self) -> Optional[Tuple[int, Any, float]]:
         with self._lock:
@@ -280,6 +321,8 @@ class DetectionNode:
         weights: str,
         conf: float,
         status_interval_s: float,
+        device: Optional[str] = None,
+        half: bool = False,
     ) -> None:
         self.bus = bus
         self.robot_id = robot_id
@@ -290,6 +333,10 @@ class DetectionNode:
         self.weights = weights
         self.conf = conf
         self.status_interval_s = status_interval_s
+        # None 이면 ultralytics 자동 선택. "0"/"cuda:0" 로 GPU 강제, "cpu" 로 CPU 강제 가능.
+        self.device = device
+        # FP16 추론 (GPU 메모리 약 절반). GPU 일 때만 적용.
+        self.half = half
         self.enabled = False
         self.state = "initializing"
         self.mission_id: Optional[str] = None
@@ -320,6 +367,45 @@ class DetectionNode:
 
         self.logger.log(sim_time_s, f"load YOLOE weights={self.weights}")
         self._model = YOLOE(self.weights)
+
+        # torch 가 CUDA 를 보는지 확인하고, --device 미지정 시 자동으로 GPU 에 올린다.
+        try:
+            import torch  # type: ignore
+
+            cuda_ok = torch.cuda.is_available()
+            gpu_name = torch.cuda.get_device_name(0) if cuda_ok else "-"
+            self.logger.log(
+                sim_time_s,
+                f"torch={torch.__version__} cuda_available={cuda_ok} "
+                f"built_cuda={torch.version.cuda} gpu={gpu_name}",
+            )
+            # --device 지정 시 그 값 우선, 미지정이면 CUDA 가 있으면 cuda:0, 없으면 cpu.
+            if self.device is None:
+                self.device = "cuda:0" if cuda_ok else "cpu"
+
+            try:
+                self._model.to(self.device)
+                self.logger.log(sim_time_s, f"move model to device={self.device}")
+            except torch.cuda.OutOfMemoryError as exc:
+                # GB10 통합 메모리가 부족(예: llama-server 등이 점유)하면 OOM. CPU 로 폴백.
+                self.logger.log(
+                    sim_time_s,
+                    f"CUDA OOM while moving model to {self.device}: {exc}. fallback to cpu",
+                )
+                torch.cuda.empty_cache()
+                self.device = "cpu"
+                self.half = False
+                self._model.to(self.device)
+        except ImportError:
+            self.logger.log(sim_time_s, "torch import failed; running on default (cpu) device")
+
+        # 모델 파라미터가 실제로 올라가 있는 device 를 확인 (cpu 면 추론이 느린 원인).
+        try:
+            model_device = next(self._model.model.parameters()).device
+            self.logger.log(sim_time_s, f"model device={model_device}")
+        except (StopIteration, AttributeError):
+            pass
+
         self.model_loaded = True
         if self.target_classes:
             self.set_model_classes(sim_time_s)
@@ -458,7 +544,16 @@ class DetectionNode:
 
         height, width = img.shape[:2]
         image_size = {"width": int(width), "height": int(height)}
-        results = self._model.predict(img, verbose=False, conf=self.conf)
+        # 한 프레임 추론에 걸리는 시간을 측정해서 로깅.
+        predict_start = time.monotonic()
+        predict_kwargs: Dict[str, Any] = {"verbose": False, "conf": self.conf}
+        if self.device is not None:
+            predict_kwargs["device"] = self.device
+        if self.half and self.device not in (None, "cpu"):
+            predict_kwargs["half"] = True
+        results = self._model.predict(img, **predict_kwargs)
+        predict_elapsed = time.monotonic() - predict_start
+        self.logger.log(sim_time_s, f"inference seq={seq} took={predict_elapsed:.3f}s")
         objects = self.build_info_detected_objects(results, image_size, robot_infos)
         image_path = self.save_annotated_frame(results, sim_time_s, seq)
 
@@ -565,21 +660,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--poll-interval", type=float, default=0.2)
     parser.add_argument("--status-interval", type=float, default=1.0)
     parser.add_argument("--conf", type=float, default=0.5)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="추론 device. 예: '0' 또는 'cuda:0' (GPU 강제), 'cpu' (CPU 강제). 미지정 시 자동.",
+    )
+    parser.add_argument(
+        "--half",
+        action="store_true",
+        help="GPU 에서 FP16 추론 (메모리 약 절반). OOM 회피에 도움.",
+    )
     parser.add_argument("--calibration", default=str(DEFAULT_CALIBRATION_PATH))
     parser.add_argument("--ground", default=str(DEFAULT_GROUND_PATH))
+    parser.add_argument(
+        "--valid-x-margin",
+        type=float,
+        default=DETECTION_VALID_X_MARGIN_RATIO,
+        help="좌/우 각각 가장자리에서 detect 를 신뢰하지 않을 폭 비율 (0~0.5)",
+    )
+    parser.add_argument(
+        "--valid-bottom-margin",
+        type=float,
+        default=DETECTION_VALID_BOTTOM_MARGIN_RATIO,
+        help="아래쪽 가장자리에서 detect 를 신뢰하지 않을 높이 비율 (0~1)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     global LOCAL_COORD_PROJECTOR
+    global DETECTION_VALID_X_MARGIN_RATIO, DETECTION_VALID_BOTTOM_MARGIN_RATIO
 
     args = parse_args()
     logger = Logger("detection-node")
+    DETECTION_VALID_X_MARGIN_RATIO = args.valid_x_margin
+    DETECTION_VALID_BOTTOM_MARGIN_RATIO = args.valid_bottom_margin
     LOCAL_COORD_PROJECTOR = GroundPlaneProjector.from_paths(
         calibration_path=Path(args.calibration),
         ground_path=Path(args.ground),
     )
     logger.log(0.0, f"load calibration={args.calibration} ground={args.ground}")
+    logger.log(
+        0.0,
+        f"detection valid region x_margin={DETECTION_VALID_X_MARGIN_RATIO} "
+        f"bottom_margin={DETECTION_VALID_BOTTOM_MARGIN_RATIO}",
+    )
 
     transport = PahoMqttTransport(
         host=args.host,
@@ -603,6 +728,8 @@ def main() -> None:
         weights=args.weights,
         conf=args.conf,
         status_interval_s=args.status_interval,
+        device=args.device,
+        half=args.half,
     )
 
     transport.start()

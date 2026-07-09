@@ -13,9 +13,37 @@ from mqtt_protocol_sim import Logger, PahoMqttTransport, TopicTransport, robot_t
 
 
 DEFAULT_DETECTION_CLASSES = ["fire extinguisher"]
-DEFAULT_DETECTION_DISABLE_RADIUS_M = 1
-MAX_DETECTED_OBJECT_DISTANCE_M = 5.0
-DETECTED_OBJECT_MERGE_RADIUS_M = 0.1
+DEFAULT_DETECTION_DISABLE_RADIUS_M = 0.5
+MAX_DETECTED_OBJECT_DISTANCE_M = 10
+DETECTED_OBJECT_MERGE_RADIUS_M = 0.15
+
+# 카메라 양 옆(좌/우)과 아래쪽 외곽은 렌즈 왜곡이 커서 좌표 신뢰도가 떨어진다.
+# 소화기 bbox 하단 변의 중점(=(cx, y2)) 이 이미지 '가운데 영역' 안에 있을 때만 detect 를 믿는다.
+DETECTION_VALID_X_MARGIN_RATIO = 0.15  # 좌/우 각각 가장자리에서 제외할 폭 비율
+DETECTION_VALID_BOTTOM_MARGIN_RATIO = 0.0  # 아래쪽 가장자리에서 제외할 높이 비율
+
+
+def is_detection_pixel_reliable(bbox: Any, image_size: Any) -> bool:
+    """bbox 하단 중점이 이미지 가운데 영역(왜곡이 적은 영역) 안에 있는지 확인한다.
+
+    좌/우 가장자리와 아래쪽 가장자리에 잡힌 detection 은 왜곡 때문에 신뢰하지 않는다.
+    bbox/imageSize 정보가 부족하면 거르지 않는다(=True).
+    """
+    if not isinstance(bbox, dict) or not isinstance(image_size, dict):
+        return True
+    try:
+        width = float(image_size.get("width", 0))
+        height = float(image_size.get("height", 0))
+        pixel_x = float(bbox["cx"])
+        pixel_y = float(bbox["y2"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if width <= 0 or height <= 0:
+        return True
+    min_x = width * DETECTION_VALID_X_MARGIN_RATIO
+    max_x = width * (1.0 - DETECTION_VALID_X_MARGIN_RATIO)
+    max_y = height * (1.0 - DETECTION_VALID_BOTTOM_MARGIN_RATIO)
+    return min_x <= pixel_x <= max_x and pixel_y <= max_y
 
 
 class VlaReferenceNode:
@@ -253,6 +281,15 @@ class VlaReferenceNode:
             f"mapName={self.latest_map_name} graphName={self.latest_graph_name} "
             f"vertices={len(vertices)} edges={len(edges)}",
         )
+        # 그래프 수신 시 각 node 의 global 좌표 전체 로깅.
+        for vertex in vertices:
+            if not isinstance(vertex, dict):
+                continue
+            self.logger.log(
+                float(payload.get("timestampMs", 0.0)),
+                f"  graph node id={vertex.get('id')} "
+                f"global=({float(vertex.get('x', 0.0)):.3f}, {float(vertex.get('y', 0.0)):.3f})",
+            )
         self.reset_active_vertices()
         self.update_state()
         self.setup_plot_if_needed()
@@ -309,6 +346,7 @@ class VlaReferenceNode:
         del topic
         robot_infos = payload.get("robotInfos", {})
         objects = payload.get("objects", [])
+        image_size = payload.get("imageSize", {})
         added_count = 0
 
         if not isinstance(robot_infos, dict) or not isinstance(objects, list):
@@ -328,12 +366,22 @@ class VlaReferenceNode:
                     if not class_name:
                         continue
 
+                    # 소화기 bbox 하단 중점이 이미지 좌/우 가장자리나 너무 아래쪽이면
+                    # 왜곡 때문에 좌표를 믿지 않고 건너뛴다.
+                    if not is_detection_pixel_reliable(detected_object.get("bbox"), image_size):
+                        self.logger.log(
+                            float(payload.get("timestampMs", 0.0)),
+                            f"skip detection class={class_name}: bbox bottom-center "
+                            f"outside valid region bbox={detected_object.get('bbox')}",
+                        )
+                        continue
+
                     local = detected_object.get("local")
                     if not isinstance(local, dict):
                         continue
 
                     try:
-                        local_x = float(local["x"])
+                        local_x = float(local["x"]) + 0.3
                         local_y = float(local["y"])
                     except (KeyError, TypeError, ValueError):
                         continue
@@ -349,8 +397,9 @@ class VlaReferenceNode:
                         robot_x = float(pose.get("x", 0.0))
                         robot_y = float(pose.get("y", 0.0))
                         robot_theta = float(pose.get("theta", 0.0))
-                        global_x = robot_x + local_x * math.cos(robot_theta) - local_y * math.sin(robot_theta)
-                        global_y = robot_y + local_x * math.sin(robot_theta) + local_y * math.cos(robot_theta)
+                        global_theta = math.pi / 2 - robot_theta
+                        global_x = robot_x + local_x * math.cos(global_theta) - local_y * math.sin(global_theta)
+                        global_y = robot_y + local_x * math.sin(global_theta) + local_y * math.cos(global_theta)
                     except (KeyError, TypeError, ValueError):
                         continue
 
